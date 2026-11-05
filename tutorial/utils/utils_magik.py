@@ -722,29 +722,34 @@ class SoftmaxHead(DeeplayModule):
       node_attr  : passed-through node attributes (for losses using coordinates)
     """
 
-    def __init__(self, base_head, eps=1e-8):
+    def __init__(self, base_head, node_features=None, eps=1e-8):
         super().__init__()
         self.base_head = base_head
         self.eps = eps
-
-        # will be lazy-initialized based on node_attr dimension
-        self.dummy_mlp = None
 
         # optional: bias for real edges initialized negative
         self.init_real_bias = -2.0
         self.init_dummy_bias = 2.0
 
-    def _lazy_init_dummy(self, node_attr):
-        """Create dummy_mlp once we know the dimensionality of node attributes."""
-        if self.dummy_mlp is not None:
-            return
+        # The node attributes reaching this head have the same dimension as
+        # the input of the base head, so `node_features` can be inferred.
+        if node_features is None:
+            node_features = getattr(self.base_head, "in_features", None)
+        if node_features is None:
+            raise ValueError(
+                "`node_features` could not be inferred from `base_head`. Pass "
+                "it explicitly as the dimension of the node attributes."
+            )
 
-        dim = node_attr.shape[1]
-        device = node_attr.device
+        # Created here rather than on the first forward pass, so that its
+        # parameters are registered as submodule parameters before the
+        # optimizer is built and therefore get trained by backpropagation.
+        self.dummy_mlp = nn.Linear(node_features, 1, bias=True)
+        self._init_dummy()
 
-        self.dummy_mlp = nn.Linear(dim, 1, bias=True).to(device)
+    def _init_dummy(self):
+        """Initialize the dummy logits so that they win early in training."""
 
-        # Initialize: dummy should win early in training
         nn.init.constant_(self.dummy_mlp.weight, 0.0)
         nn.init.constant_(self.dummy_mlp.bias, self.init_dummy_bias)
 
@@ -759,8 +764,12 @@ class SoftmaxHead(DeeplayModule):
         num_nodes = node_attr.shape[0]
         device = src.device
 
-        # lazy create dummy MLP after dimension known
-        self._lazy_init_dummy(node_attr)
+        if node_attr.shape[1] != self.dummy_mlp.in_features:
+            raise ValueError(
+                f"The node attributes have {node_attr.shape[1]} features, but "
+                f"the dummy expects {self.dummy_mlp.in_features}. Pass the "
+                "right `node_features` when constructing the head."
+            )
 
         # ---- Real-edge logits ----
         logits = self.base_head(edge_attr).view(-1)  # [N_edges]
