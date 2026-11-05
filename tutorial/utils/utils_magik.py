@@ -117,19 +117,23 @@ class GraphFromTrajectories:
             of the particles.
         frame_indices : np.ndarray
             The frame indices corresponding to the nodes in the graph.
-        
+
         Returns
         -------
         tuple[np.ndarray, np.ndarray]
-            A tuple containing the edge indices and edge attributes of the 
-            graph. The edge indices represent the connectivity between nodes, 
-            and the edge attributes represent the distances between connected 
+            A tuple containing the edge indices and edge attributes of the
+            graph. The edge indices represent the connectivity between nodes,
+            and the edge attributes represent the distances between connected
             nodes.
+
+        The frame indices must be sorted in increasing order, as `__call__`
+        does before calling this method, so that the inner loop can stop at
+        the first neighbor that is too far in time.
 
         """
 
-        edges = []          
-        edge_features = [] 
+        edges = []
+        edge_features = []
         num_nodes = len(positions)
 
         for node_idx in range(num_nodes):
@@ -157,7 +161,7 @@ class GraphFromTrajectories:
 
         edges = np.array(edges, dtype=np.int64)
         edge_features = np.array(edge_features, dtype=np.float32)
-            
+
         return edges, edge_features
 
     def get_gt_connectivity(
@@ -796,10 +800,6 @@ class SoftmaxHead(DeeplayModule):
 
         # real-edge probabilities for training and metrics
         probs_real = probs_all[~dummy_mask].unsqueeze(-1)   # [N_edges, 1]
-
-
-        # ---- Extract real-edge probs ----
-        probs_real = probs_all[~dummy_mask].unsqueeze(-1)  # [N_edges, 1]
 
         return (probs_real, edge_index, probs_all, all_src, dummy_mask)
 
