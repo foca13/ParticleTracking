@@ -44,6 +44,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from scipy.optimize import linear_sum_assignment
 from torch_geometric.data import Data
 from deeplay import DeeplayModule
 
@@ -598,25 +599,77 @@ class NodeDropout:
 
 
 class ComputeTrajectories:
-    """
-    Reconstruct trajectories from Sinkhorn-based edge predictions.
+    """Reconstruct trajectories from the edge predictions of the model.
 
-    The Sinkhorn head already enforces near one-to-one assignments
-    between sources and targets. This class thresholds low-probability
-    links and builds connected components as trajectories.
+    The head of the model normalizes, for every node, over that node's
+    outgoing candidate edges plus a learnable dummy ("no successor") option,
+    so that each row of the implied assignment matrix sums to one. This class
+    decodes those probabilities into trajectories: it keeps the edges the
+    model scored above a threshold, and lets no node take more than one
+    outgoing or more than one incoming edge.
+
+    Candidate edges always advance in time, so once both constraints hold,
+    each connected component is a chain whose frames strictly increase and a
+    trajectory can never hold two detections of the same frame. Constraining
+    a single direction is not enough: a node left free to keep several
+    outgoing edges starts two parallel chains that are reported as one
+    trajectory, and a node left free to keep several incoming edges merges
+    two chains in the same way.
+
+    Parameters
+    ----------
+    p_min : float, optional
+        Minimum probability for an edge to be considered a link at all, the
+        same for every node. When it is left out, the threshold of each node
+        is its own dummy probability instead, so that a link is kept only
+        when the model finds it more probable than that node having no
+        successor at all. The dummy is trained to make exactly that call, and
+        is the better threshold of the two, so prefer leaving `p_min` out.
+    method : {"lap", "greedy"}, default="lap"
+        How links are selected among the edges above the threshold.
+
+        - "lap" solves one linear assignment problem, which maximizes the
+          total log-probability of the kept links exactly. It recovers the
+          links "greedy" gives up when two nodes compete for the same
+          successor, the loser falling back to its next-best edge rather than
+          to none. Costs O(n^2) memory and up to O(n^3) time in the number of
+          nodes carrying a candidate edge.
+        - "greedy" walks the edges in order of decreasing probability and
+          keeps each one whose source has no successor and whose target has
+          no predecessor yet. Linear in the number of candidate edges, apart
+          from the sort, and so the choice for graphs too large to assign,
+          but it commits to a link before seeing the ones it rules out and
+          measures clearly worse than "lap".
+
+    Notes
+    -----
+    The formulation this head is named after is Sinkhorn's algorithm, which
+    alternately normalizes the rows and the columns of a non-negative matrix
+    until it is doubly stochastic, that is until it is a soft and
+    differentiable one-to-one assignment. The head as implemented normalizes
+    rows only, which expresses "at most one successor" and leaves the column
+    constraint, "at most one predecessor", entirely to this class.
+    `method="lap"` enforces it exactly, and the dummy of each node plays the
+    part of the slack entry, usually called a dustbin, that lets a detection
+    stay unmatched when a trajectory is born or ends.
     """
 
-    def __init__(self, p_min: float = 0.5):
+    def __init__(self, p_min: float | None = None, method: str = "lap"):
+        if method not in ("greedy", "lap"):
+            raise ValueError(f"Unknown method: {method!r}")
+
         self.p_min = p_min
+        self.method = method
 
     def __call__(self, graph, predictions):
         """
         Parameters
         ----------
         graph : object
-            Graph-like structure with attributes such as 'frames'.
+            Graph-like structure with attributes such as 'frames'. Unused,
+            and kept for backwards compatibility of the call signature.
         predictions : tuple
-            Output of the Sinkhorn head:
+            Output of the softmax head:
               (probs_real, edge_index, probs_all, all_src, dummy_mask)
 
         Returns
@@ -632,32 +685,126 @@ class ComputeTrajectories:
             dummy_mask,
         ) = predictions
 
-        # Move to CPU numpy
+        # Move to CPU numpy. Reshape rather than squeeze, so that a graph
+        # holding a single candidate edge stays one-dimensional.
         edge_index = edge_index.detach().cpu().numpy()
-        probs_real = probs_real.detach().cpu().numpy().squeeze()
+        probs_real = probs_real.detach().cpu().numpy().reshape(-1)
 
-        # Select edges above probability threshold
-        valid = probs_real >= self.p_min
-        edges = edge_index[:, valid].T
-        scores = probs_real[valid]
+        sources, targets = edge_index[0], edge_index[1]
 
-        # Optional: enforce at most one incoming edge per target
-        order = np.argsort(-scores)
-        used_targets = set()
-        pruned_edges = []
-        for i in order:
-            s, t = edges[i]
-            if t not in used_targets:
-                pruned_edges.append((int(s), int(t)))
-                used_targets.add(t)
+        # The threshold an edge has to clear: one value for the whole graph,
+        # or what its own source node gives up by taking a link.
+        if self.p_min is None:
+            threshold = self.dummy_probs(probs_all, all_src, dummy_mask)[sources]
+        else:
+            threshold = np.full(len(probs_real), self.p_min)
 
-        # Build graph from pruned edges
-        pruned_graph = nx.Graph()
+        # Select edges above probability threshold.
+        candidates = np.flatnonzero(probs_real > threshold)
+
+        if len(candidates) == 0:
+            return []
+
+        if self.method == "lap":
+            candidates = self.match_lap(
+                candidates, sources, targets, probs_real, threshold[candidates]
+            )
+        else:
+            candidates = self.keep_one_per_node(
+                candidates, sources, targets, probs_real
+            )
+
+        pruned_edges = [
+            (int(sources[edge]), int(targets[edge])) for edge in candidates
+        ]
+
+        # Build a directed graph, so that the time ordering of the links is
+        # not discarded, and read each component off as one trajectory.
+        pruned_graph = nx.DiGraph()
         pruned_graph.add_edges_from(pruned_edges)
 
         # Extract connected components as trajectories
-        trajectories = list(nx.connected_components(pruned_graph))
+        trajectories = list(nx.weakly_connected_components(pruned_graph))
         return trajectories
+
+    @staticmethod
+    def dummy_probs(probs_all, all_src, dummy_mask):
+        """Read off the dummy ("no successor") probability of every node."""
+
+        dummy_mask = dummy_mask.detach().cpu().numpy().reshape(-1)
+        probs_all = probs_all.detach().cpu().numpy().reshape(-1)
+        all_src = all_src.detach().cpu().numpy().reshape(-1)
+
+        dummy_probs = np.zeros(int(all_src.max()) + 1)
+        dummy_probs[all_src[dummy_mask]] = probs_all[dummy_mask]
+
+        return dummy_probs
+
+    @staticmethod
+    def keep_one_per_node(candidates, sources, targets, probs_real):
+        """Keep one outgoing and one incoming edge per node, greedily.
+
+        The edges are visited in order of decreasing probability, and each is
+        kept unless its source already has a successor or its target already
+        has a predecessor.
+        """
+
+        candidates = candidates[np.argsort(-probs_real[candidates])]
+
+        used_sources = set()
+        used_targets = set()
+        kept = []
+        for edge in candidates:
+            source = int(sources[edge])
+            target = int(targets[edge])
+
+            if source in used_sources or target in used_targets:
+                continue
+
+            kept.append(edge)
+            used_sources.add(source)
+            used_targets.add(target)
+
+        return np.array(kept, dtype=int)
+
+    @staticmethod
+    def match_lap(candidates, sources, targets, probs_real, threshold):
+        """Match sources to targets one-to-one, maximizing log-probability.
+
+        Costs are `-log(p / threshold)`, negative for every candidate, so
+        leaving a node unlinked costs nothing and the no-link padding usually
+        needed in an assignment matrix can be dropped. Only the nodes
+        carrying a candidate edge enter the matrix.
+        """
+
+        edge_sources = sources[candidates]
+        edge_targets = targets[candidates]
+
+        # Compact the node ids, so the matrix covers candidates only.
+        nodes = np.unique(np.concatenate([edge_sources, edge_targets]))
+        index_of = {node: index for index, node in enumerate(nodes)}
+
+        rows = np.fromiter(
+            (index_of[node] for node in edge_sources), int, len(candidates)
+        )
+        cols = np.fromiter(
+            (index_of[node] for node in edge_targets), int, len(candidates)
+        )
+
+        cost = np.zeros((len(nodes), len(nodes)))
+        cost[rows, cols] = -np.log(
+            probs_real[candidates] / np.maximum(threshold, 1e-12)
+        )
+
+        # Remember which candidate each cell stands for.
+        edge_at = np.full((len(nodes), len(nodes)), -1, dtype=int)
+        edge_at[rows, cols] = candidates
+
+        # Solve, then keep only the assignments that pay off.
+        row_index, col_index = linear_sum_assignment(cost)
+        pays_off = cost[row_index, col_index] < 0
+
+        return edge_at[row_index[pays_off], col_index[pays_off]]
 
 
 def make_list(
