@@ -776,7 +776,10 @@ class SoftmaxHead(DeeplayModule):
         logits = logits.clamp(-10, 10)
 
         # ---- Dummy logits ----
+        # Clamped like the real logits: now that `dummy_mlp` is trained, an
+        # unbounded dummy logit would make the exponentials below overflow.
         dummy_logits = self.dummy_mlp(node_attr).view(-1)  # [N_nodes]
+        dummy_logits = dummy_logits.clamp(-10, 10)
 
         # ---- Combine all ----
         all_logits = torch.cat([logits, dummy_logits], dim=0)  # [E + N]
@@ -785,15 +788,15 @@ class SoftmaxHead(DeeplayModule):
 
         # ---- Per-source softmax ----
 
-        # Scatter-reduce "amax" is not supported on MPS → manual segment max
+        # Shift by the per-source maximum, for numerical stability. An
+        # `index_put_` cannot do this: with several edges leaving one node its
+        # indices repeat, and without accumulation the last write wins rather
+        # than the largest, which leaves the shift at the mercy of the entry
+        # order. That was harmless while the dummy logit was a constant, and
+        # overflows to NaN once it is trained.
         max_per_src = torch.full((num_nodes,), float("-inf"), device=src.device)
-
-        # Compute maximum logit per source
-        # For each entry i: max_per_src[all_src[i]] = max(old, all_logits[i])
-        max_per_src = max_per_src.index_put_(
-            (all_src,),
-            torch.maximum(max_per_src[all_src], all_logits),
-            accumulate=False
+        max_per_src = max_per_src.scatter_reduce(
+            0, all_src, all_logits, reduce="amax", include_self=True
         )
 
         # Exponentiate shifted logits (numerically stable)
